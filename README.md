@@ -1,6 +1,6 @@
 # proxy-please
 
-> *Your packets, please.* — A transparent egress proxy inspired by Papers, Please.
+> *Your packets, please.*
 
 A transparent TCP proxy written in Rust. Designed to sit on a VM that receives traffic via an **Azure User-Defined Route (UDR)** and enforce an egress whitelist for HTTP and HTTPS traffic.
 
