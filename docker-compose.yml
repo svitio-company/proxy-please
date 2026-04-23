@@ -1,0 +1,30 @@
+services:
+  proxy:
+    build: .
+    image: proxy-please:latest
+    container_name: proxy-please
+
+    # Share the host network namespace so:
+    #   1. iptables rules set inside the container affect the host NIC
+    #   2. SO_ORIGINAL_DST returns the real pre-NAT destination
+    network_mode: host
+
+    # NET_ADMIN  – required to manipulate iptables
+    # NET_RAW    – required for raw socket access (some kernels)
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+    restart: unless-stopped
+
+    environment:
+      # Comma-separated list of allowed hostnames.
+      # Supports exact matches and single-level wildcards (*.example.com).
+      # Leave empty or omit to deny ALL traffic (default-deny).
+      ALLOWED_HOSTS: ""
+
+      # Log level: error | warn | info | debug | trace
+      RUST_LOG: "info"
+
+    # Uncomment to load the env file instead of editing this file
+    # env_file: .env
