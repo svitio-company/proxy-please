@@ -9,9 +9,12 @@ use std::collections::HashSet;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 /// Port where HTTP traffic is redirected (iptables: 80 → 8080)
 const HTTP_PROXY_PORT: u16 = 8080;
@@ -51,17 +54,21 @@ impl Config {
 
     fn is_allowed(&self, host: &str) -> bool {
         let host = host.to_lowercase();
-        // Strip trailing port if present (e.g. "host:8080" → "host")
-        let host = host.split(':').next().unwrap_or(&host);
+        let host = strip_port(&host);
 
         // Exact match
         if self.allowed_hosts.contains(host) {
             return true;
         }
 
-        // Single-level wildcard: *.example.com matches sub.example.com
-        if let Some((_, parent)) = host.split_once('.') {
-            let wildcard = format!("*.{parent}");
+        // Iterative wildcard match: match *.example.com, *.com, etc.
+        let mut parts: Vec<&str> = host.split('.').collect();
+        while !parts.is_empty() {
+            parts.remove(0);
+            if parts.is_empty() {
+                break;
+            }
+            let wildcard = format!("*.{}", parts.join("."));
             if self.allowed_hosts.contains(&wildcard) {
                 return true;
             }
@@ -106,9 +113,12 @@ async fn main() {
     let cfg_h = config.clone();
     let cfg_s = config.clone();
 
+    // Limit max concurrent connections to prevent resource exhaustion
+    let semaphore = Arc::new(Semaphore::new(10000));
+
     tokio::join!(
-        accept_loop(http_listener, cfg_h, false),
-        accept_loop(https_listener, cfg_s, true),
+        accept_loop(http_listener, cfg_h, false, semaphore.clone()),
+        accept_loop(https_listener, cfg_s, true, semaphore),
     );
 }
 
@@ -116,12 +126,14 @@ async fn main() {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-async fn accept_loop(listener: TcpListener, config: Arc<Config>, tls: bool) {
+async fn accept_loop(listener: TcpListener, config: Arc<Config>, tls: bool, semaphore: Arc<Semaphore>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let cfg = config.clone();
+                let sem = semaphore.clone();
                 tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok();
                     handle_connection(stream, peer, cfg, tls).await;
                 });
             }
@@ -168,11 +180,16 @@ async fn handle_http(
         if total == buf.len() {
             break; // buffer full – proceed with what we have
         }
-        match client.read(&mut buf[total..]).await {
-            Ok(0) => return, // client disconnected
-            Ok(n) => total += n,
-            Err(e) => {
+        let read_future = client.read(&mut buf[total..]);
+        match timeout(Duration::from_secs(10), read_future).await {
+            Ok(Ok(0)) => return, // client disconnected
+            Ok(Ok(n)) => total += n,
+            Ok(Err(e)) => {
                 tracing::debug!(%peer, "HTTP read error: {e}");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(%peer, "HTTP read timeout");
                 return;
             }
         }
@@ -226,22 +243,40 @@ async fn handle_http(
 // ---------------------------------------------------------------------------
 
 async fn handle_https(
-    client: TcpStream,
+    mut client: TcpStream,
     peer: SocketAddr,
     dst: SocketAddr,
     config: Arc<Config>,
 ) {
-    // Peek without consuming – the ClientHello is forwarded verbatim downstream
     let mut buf = vec![0u8; TLS_PEEK_BUF];
-    let n = match client.peek(&mut buf).await {
-        Ok(0) | Err(_) => return,
-        Ok(n) => n,
-    };
+    let mut total = 0usize;
+    let mut sni = None;
 
-    let sni = match parse_sni(&buf[..n]) {
+    // Buffer data until we can parse SNI or buffer fills
+    loop {
+        if total == buf.len() {
+            break;
+        }
+
+        let read_future = client.read(&mut buf[total..]);
+        match timeout(Duration::from_secs(10), read_future).await {
+            Ok(Ok(0)) => return,
+            Ok(Ok(n)) => {
+                total += n;
+                // Try parsing SNI with the accumulated data
+                if let Some(s) = parse_sni(&buf[..total]) {
+                    sni = Some(s);
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => return, // Handle error or timeout identically: drop socket
+        }
+    }
+
+    let sni = match sni {
         Some(s) => s,
         None => {
-            tracing::warn!(%peer, %dst, "No SNI in ClientHello – denying");
+            tracing::warn!(%peer, %dst, "No SNI in ClientHello (or malformed) – denying");
             return;
         }
     };
@@ -253,7 +288,7 @@ async fn handle_https(
 
     tracing::info!(%peer, %dst, sni = %sni, "ALLOWED HTTPS");
 
-    let upstream = match TcpStream::connect(dst).await {
+    let mut upstream = match TcpStream::connect(dst).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%dst, "Upstream connect failed: {e}");
@@ -261,7 +296,11 @@ async fn handle_https(
         }
     };
 
-    // The peeked data is still in the stream, so bidirectional copy sends it naturally
+    // Forward the accumulated bytes first
+    if upstream.write_all(&buf[..total]).await.is_err() {
+        return;
+    }
+
     proxy_bidirectional(client, upstream).await;
 }
 
@@ -294,11 +333,23 @@ fn parse_http_host(data: &[u8]) -> Option<String> {
     for line in text.lines() {
         if line.len() > 5 && line[..5].eq_ignore_ascii_case("host:") {
             let value = line[5..].trim();
-            // Drop the port component if present
-            return Some(value.split(':').next().unwrap_or(value).to_string());
+            return Some(strip_port(value).to_string());
         }
     }
     None
+}
+
+fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        if let Some(end) = host.rfind(']') {
+            return &host[1..end];
+        }
+    }
+    if let Some((h, _)) = host.rsplit_once(':') {
+        h
+    } else {
+        host
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +488,9 @@ fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
 
 /// Stub for non-Linux platforms (development only)
 #[cfg(not(target_os = "linux"))]
-fn get_original_dst(_stream: &TcpStream) -> Option<SocketAddr> {
-    None
+fn get_original_dst(stream: &TcpStream) -> Option<SocketAddr> {
+    // For local development on macOS/Windows, normally you'd use a fixed target via env 
+    // or just assume local port 8080 forwards to some specific host.
+    // For simplicity, we just use the stream's local address.
+    stream.local_addr().ok()
 }
